@@ -6,32 +6,46 @@
 
 A momentum paper-trading bot for the [Pump.fun Paper Sprint](https://make.fun/bounty/u-boothlord-pump-fun-paper-sprint-any-bot-can-f83c389b) competition on [make.fun](https://make.fun). The bot paper-trades pump.fun bonding curves on a 6-hour replay of real market data; the highest net PnL wins the pot.
 
-## Strategy
+## Strategy (v2)
 
-A compact momentum bot, tuned for this competition's numbers (10 SOL capital,
-max 5 open positions, max 16 orders per batch, 2-slot latency, 105,000
-lamports tx fee per order, guardrail of at least 20 coins with a round trip
-of at least 0.01 SOL, max drawdown 50%):
+Rebuilt after v1's local grade missed the guardrail entirely (3 coins
+traded, about −9.7 SOL on the dev window): its entry filters were so strict
+that almost nothing fired, and its few 2 SOL positions bled out. V2 is
+guardrail-first, with a smaller, faster momentum sleeve. Tuned for this
+competition's numbers (10 SOL capital, max 5 open positions, max 16 orders
+per batch, 2-slot latency, 105,000 lamports tx fee per order, guardrail of
+at least 20 coins with a round trip of at least 0.01 SOL, max drawdown 50%):
 
-- **Entry.** A mature curve (at least 500 slots since its `CreateEvent`)
-  whose recent 30-slot tape shows accelerating net SOL inflow: net buys of
-  at least 1 SOL, at least 3 buy trades, at least 5 distinct buyers, price
-  up at least 5% (and at most 150%) over the window, sitting within 5% of
-  the window high, with the newer half of the window out-flowing the older
-  half, and real SOL reserves between 2 and 60 SOL. The first buy is small:
-  0.05 SOL.
-- **Pyramid.** Adds 0.2 SOL per batch into strength only — price above the
-  last buy's price, position in profit, net inflow still positive — up to a
-  2 SOL total stake per coin.
-- **Exit.** Sells the whole position on the first of: stop-loss −20% vs
-  cost, trailing stop −30% from the peak value (armed once up 5%), fading
-  net flow, or a 1500-slot max hold. A completed curve is closed by the
-  replay itself.
-- **Guardrail probes.** When the bot's own fills or coins lag the pace
-  (25 coins / 240 fills over the run), it opens tiny 0.01 SOL probe round
-  trips on liquid curves, so the 20-coin guardrail is met even in a quiet
-  window. A 0.01 SOL buy is exactly the round-trip minimum
-  (10,000,000 lamports).
+- **Guardrail probes first.** Every mint whose real SOL reserve reaches
+  0.55 SOL joins a probe queue. A probe accumulates ~0.012 SOL of buy fills
+  — stacked in tranches across batches when the 1%-of-reserve cap makes a
+  single buy smaller than the 0.01 SOL round-trip minimum — then sells the
+  whole position a few slots later, whatever the PnL. Probes have priority
+  over momentum for free position slots and aim for 30 counted round trips
+  (the guardrail needs 20). On the dev window the probe engine is roughly
+  break-even after fees; it exists to make compliance a certainty, not a
+  hope.
+- **Momentum, looser and smaller.** Entry needs a curve at least 60 slots
+  old with at least 10 observed trades, net inflow of at least 0.4 SOL over
+  the last 60 slots (or 0.7 SOL of buy volume at a 60%+ buy share), at
+  least 4 distinct buyers in the window, price up at least 3% over the
+  last 120 slots but no more than 1.6× the 300-slot base low (no chasing
+  parabolic tops), and real reserves of at least 1.5 SOL. First buy
+  0.06 SOL, at most one pyramid add of 0.12 SOL into strength, hard stake
+  cap 0.35 SOL per mint.
+- **Fast exits.** Stop-loss at −12% versus average cost; trailing stop
+  armed at +8% and firing 15% below the peak; half the position sold if
+  the price doubles; 600-slot max hold. A drawdown circuit breaker halts
+  new momentum entries if equity falls 35% below its peak (probes keep
+  running). A completed curve is closed by the replay itself.
+- **Fee discipline.** Pending orders are tracked against cash, a cash
+  buffer is always kept, and orders are emitted in priority order — exits,
+  probe sells/buys, then momentum — inside the 16-order batch cap.
+
+Local grade on the kit's frozen 24 h dev window (process driver):
+guardrail-compliant with 331 counted round trips over 181 mints, max
+drawdown 17.6%, net PnL −1.36 SOL (v1: non-compliant, −9.7 SOL). The dev
+window is one sample; the final ranking runs on a separate 6-hour window.
 
 ## How it works
 

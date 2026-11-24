@@ -1,633 +1,691 @@
-"""Momentum bot for "Pump.fun Paper Sprint: Any Bot Can Win"
-(u-boothlord-pump-fun-paper-sprint-any-bot-can-f83c389b).
+#!/usr/bin/env python3
+"""Boothlord Pump.fun Paper Sprint bot -- v2.
 
-Speaks agent-fun/replay/v2 on stdin/stdout: one ``hello``, then one ``reply``
-per ``batch`` (echoing the batch's ``seq``), and exits cleanly on ``done``.
-Python 3.13 standard library only; everything the bot runs is this one file.
+Strategy in one paragraph: guardrail first, momentum second, capital always.
+A probe engine guarantees the 20-coin round-trip guardrail by cycling tiny
+~0.012 SOL round trips on every mint with real liquidity, front-loaded and
+never blocked by the momentum filters.  A deliberately loose momentum sleeve
+then trades small stakes (<= 0.4 SOL per mint) on curves with fresh net
+inflow, and every position is cut fast: -12% stop-loss, an early-armed
+trailing stop, a 600-slot max hold and a half-off take-profit at 2x.
 
-Strategy (a compact momentum bot, tuned for this competition's numbers:
-10 SOL capital, max 5 open positions, max 16 orders/batch, 2-slot latency,
-105,000 lamports tx fee per order, guardrail >= 20 coins with a round trip
-of >= 0.01 SOL, max drawdown 50%):
+Protocol: agent-fun/replay/v2 -- one long-lived process, newline-delimited
+JSON on stdin/stdout.  Reads `hello` once, answers every `batch` with exactly
+one `reply` echoing its `seq`, exits on `done`.  Stdout carries replies only.
 
-* Entry: a mature curve (age >= 500 slots since its CreateEvent) whose
-  recent 30-slot tape shows accelerating net SOL inflow (net buys >= 1 SOL,
-  >= 3 buy trades, >= 5 distinct buyers), price up >= 5% (and <= 150%)
-  over the window, sitting within 5% of the window high, with the newer
-  half of the window out-flowing the older half, and real SOL reserves
-  between 2 and 60 SOL. First buy is small (0.05 SOL).
-* Pyramid: add 0.2 SOL per batch into strength only (price above the last
-  buy's price, position in profit, net inflow still positive), up to a
-  2 SOL total stake per coin.
-* Exit whole on: stop-loss -20% vs cost, trailing stop -30% from the peak
-  value (armed once up 5%), fading net flow, a single large sell, or a
-  1500-slot max hold. A completed curve is closed by the replay itself.
-* Guardrail probes: when the bot's own fills/coins lag the pace (25 coins /
-  240 fills over the run), it opens tiny 0.01 SOL probe round trips on
-  liquid curves so the 20-coin guardrail is met even in a quiet window.
-  A 0.01 SOL buy is exactly the round-trip minimum (10,000,000 lamports).
-
-Deterministic by construction: no clock, no environment reads, no
-unseeded randomness; every iteration is over insertion-ordered dicts/lists
-fed by the batch stream, so two runs produce byte-identical action logs.
+Determinism: no wall clock, no randomness, no environment reads; all
+iteration that can affect output order is over insertion-ordered dicts or
+explicitly sorted keys, and every threshold is a pure function of the event
+stream.
 """
 
 import json
-import math
-import re
 import sys
+from collections import deque
 
-PROTOCOL = "agent-fun/replay/v2"
-MAX_HARNESS_LINE_BYTES = 1_048_576
-MAX_BOT_LINE_BYTES = 65_536
-LAMPORTS_PER_SOL = 1_000_000_000
-BPS = 10_000
-U64_MAX = 2**64 - 1
-CURVE_FEE = 0.0125  # 95 bps protocol + 30 bps creator fallback = 125 bps
+# ---------------------------------------------------------------------------
+# Constants (lamports unless noted).  Run parameters from `hello` override
+# the fee/cap defaults below when the harness provides them.
+# ---------------------------------------------------------------------------
 
-_PUBKEY_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
-_CLIENT_ID_RE = re.compile(r"[A-Za-z0-9-][A-Za-z0-9_-]{0,63}")
+TX_FEE_DEFAULT = 105_000            # 5,000 base + 100,000 priority
+MIN_ROUND_TRIP_BUY = 10_000_000     # guardrail: buy fills >= 0.01 SOL per coin
 
-# --- strategy parameters (tuned on this competition's dev window) ---
-WINDOW = 30            # entry lookback, slots
-MIN_NET_SOL = 1.0      # net buy SOL over the window
-MIN_BUYS = 3           # buy trades in the window
-MIN_BUYERS = 5         # distinct buying wallets in the window
-MIN_PRICE_UP = 0.05    # price now vs window start, minus 1
-MAX_PRICE_UP = 1.5     # skip curves that already ran too far
-ACCEL = 1.0            # newer-half net inflow >= ACCEL * older-half net inflow
-NEAR_HIGH = 0.95       # price now >= 95% of the window high
-MIN_RQ_SOL = 2.0       # real SOL reserves at entry, min
-MAX_RQ_SOL = 60.0      # real SOL reserves at entry, max
-MIN_AGE = 500          # slots since CreateEvent before an entry is allowed
-STAKE_SOL = 2.0        # SOL into one position in total
-INITIAL_SOL = 0.05     # first buy of a position
-ADD_SOL = 0.2          # each pyramid add-on buy
-MIN_BUY_SOL = 0.01     # smallest buy worth sending
-BUY_SLIP_BPS = 1500    # slippage on buys; sells always go out at 10000
-STOP_LOSS = 0.20       # exit when value < cost * (1 - STOP_LOSS)
-TRAIL = 0.30           # trailing stop from the peak value
-TRAIL_ARM = 0.05       # trail arms once value >= cost * (1 + TRAIL_ARM)
-MAX_HOLD = 1500        # exit after this many slots held
-COOLDOWN = 150         # slots to wait after an exit before re-buying a curve
-MAX_ENTRIES = 2        # most entries per curve over the run
-MAX_MAIN = 5           # most momentum positions open at once
-MAX_EXPOSURE_SOL = 6.0  # most SOL at cost across all positions at once
-TARGET_COINS = 25      # guardrail pacing: coins to reach over the run
-TARGET_FILLS = 240     # guardrail pacing: fills to reach over the run
-PACE_SECS = 14_400     # pacing horizon, seconds of block time
-PROBE_SOL = 0.01       # probe round-trip buy size (== round-trip minimum)
-MAX_PROBES = 1         # most probe round trips open at once
+# Probe engine (guardrail).
+PROBE_TARGET_COUNT = 30             # counted round trips to aim for (>= 20 req)
+PROBE_TARGET_BUYS = 12_000_000      # cumulative buy fills per probe mint
+PROBE_MIN_RESERVE = 55_000_000      # real SOL reserve floor to start a probe
+PROBE_MIN_PER_REPLY = 2_500_000     # smallest probe tranche worth its tx fee
+PROBE_SELL_AGE = 6                  # slots after last buy fill before selling
+PROBE_GIVE_UP_AGE = 90              # sell an under-filled probe anyway by then
+PROBE_MAX_ATTEMPTS = 4              # failed/rejected probe buys before giving up
+PROBE_RECENT_TRADE = 6_000          # mint must have traded within this window
+
+# Momentum sleeve.
+MOM_MAX_STAKE = 350_000_000         # 0.35 SOL total buys per mint, hard cap
+MOM_FIRST_BUY = 60_000_000          # desired first buy (reserve cap may shrink)
+MOM_MIN_BUY = 15_000_000            # never send a momentum buy below this
+MOM_ADD_BUY = 120_000_000           # the single allowed pyramid add
+MOM_MIN_AGE = 60                    # curve age in slots before entry
+MOM_MIN_TRADES = 10                 # observed trades before entry
+MOM_INFLOW_WINDOW = 60              # slots for the inflow test
+MOM_INFLOW_MIN = 400_000_000        # net inflow over the window, lamports
+MOM_BUYVOL_MIN = 700_000_000        # alternative: raw buy volume in window
+MOM_BUY_SHARE_MIN = 0.60            # ... with at least this buy share
+MOM_MIN_BUYERS = 4                  # distinct buyers inside the window
+MOM_LAG = 120                       # momentum lookback in slots
+MOM_MIN_GAIN = 0.03                 # price must be up >= 3% over the lag
+MOM_MAX_VS_BASE = 1.60              # skip if price > 1.6x the recent base low
+MOM_BASE_WINDOW = 300               # slots for the base-low calculation
+MOM_MIN_RESERVE = 150_000_000       # real SOL reserve floor for entries
+MOM_COOLDOWN = 300                  # slots after a full exit before re-entry
+MOM_EVAL_EVERY = 10                 # min slots between evaluations per mint
+
+# Exits.
+STOP_LOSS_FRAC = 0.12               # sell all at -12% vs average cost
+TRAIL_ARM_FRAC = 0.08               # trailing stop arms at +8%
+TRAIL_DROP_FRAC = 0.15              # ... and fires 15% below the peak
+MAX_HOLD_SLOTS = 600                # time stop for momentum positions
+TAKE_PROFIT_MULT = 2.0              # sell half when price doubles
+
+# Cash / tape discipline.
+DD_HALT_FRAC = 0.35                 # halt momentum entries at this drawdown
+CASH_BUFFER = 30_000_000            # lamports always left uncommitted
+TAPE_KEEP_SLOTS = 900               # per-mint trade tape retention
+TAPE_MAX_TRADES = 400               # per-mint tape length cap
+
+# Slippage tolerances (bps).
+SLIP_BUY = 1_000
+SLIP_EXIT = 3_000
+SLIP_PROBE_SELL = 10_000
 
 
-class ProtocolError(Exception):
-    pass
+# ---------------------------------------------------------------------------
+# Per-mint state
+# ---------------------------------------------------------------------------
 
-
-class OrderError(Exception):
-    pass
-
-
-class Curve:
+class Mint(object):
     __slots__ = (
-        "mint", "created_slot", "virtual_token_reserves", "virtual_quote_reserves",
-        "real_token_reserves", "real_quote_reserves", "reserves_slot", "complete",
+        "created", "alive", "vsol", "vtok", "rsol", "rtok",
+        "last_trade_slot", "total_trades", "tape",
+        "buy_fills", "total_buys", "stake_mom",
+        "probe_stage", "probe_attempts", "probe_last_fill", "in_queue",
+        "counted", "last_exit_slot", "mom_eval_slot",
+        "open_slot", "peak_price", "tp_done", "added",
     )
 
-    def __init__(self, mint, created_slot, slot):
-        self.mint = mint
-        self.created_slot = created_slot
-        self.virtual_token_reserves = 0
-        self.virtual_quote_reserves = 0
-        self.real_token_reserves = 0
-        self.real_quote_reserves = 0
-        self.reserves_slot = slot
-        self.complete = False
+    def __init__(self, created):
+        self.created = created
+        self.alive = True
+        self.vsol = 0
+        self.vtok = 0
+        self.rsol = 0
+        self.rtok = 0
+        self.last_trade_slot = -1
+        self.total_trades = 0
+        self.tape = deque()          # (slot, signed_sol, is_buy, user, price)
+        self.buy_fills = 0           # cumulative filled buy quote (lamports)
+        self.total_buys = 0          # same, kept for the stake cap
+        self.stake_mom = 0           # momentum buys only
+        self.probe_stage = "none"    # none | accumulating | holding
+        self.probe_attempts = 0
+        self.probe_last_fill = -1
+        self.in_queue = False
+        self.counted = False
+        self.last_exit_slot = -1
+        self.mom_eval_slot = -1
+        # Live-position bookkeeping (meaningful only while held).
+        self.open_slot = -1
+        self.peak_price = 0.0
+        self.tp_done = False
+        self.added = False
+
+    def price(self):
+        if self.vtok > 0:
+            return self.vsol / self.vtok
+        return 0.0
 
 
-class Tape:
-    """A curve's rolling trade tape plus entry bookkeeping."""
+def _reserves(ev):
+    """Pull (virtual_sol, virtual_token, real_sol, real_token) from an event
+    or mark, tolerating both the *_sol_* and *_quote_* field spellings."""
+    vsol = ev.get("virtual_quote_reserves")
+    if vsol is None:
+        vsol = ev.get("virtual_sol_reserves")
+    rsol = ev.get("real_quote_reserves")
+    if rsol is None:
+        rsol = ev.get("real_sol_reserves")
+    vtok = ev.get("virtual_token_reserves")
+    rtok = ev.get("real_token_reserves")
+    return (
+        int(vsol) if vsol is not None else 0,
+        int(vtok) if vtok is not None else 0,
+        int(rsol) if rsol is not None else 0,
+        int(rtok) if rtok is not None else 0,
+    )
 
-    __slots__ = ("created", "trades", "entries", "last_exit")
 
+# ---------------------------------------------------------------------------
+# Bot
+# ---------------------------------------------------------------------------
+
+class Bot(object):
     def __init__(self):
-        self.created = None
-        self.trades = []  # (slot, is_buy, sol, user, price), slot order
-        self.entries = 0
-        self.last_exit = -10**12
+        self.tx_fee = TX_FEE_DEFAULT
+        self.max_positions = 5
+        self.max_orders = 16
+        self.reserve_bps = 100       # per-mint per-reply buy cap, bps of rsol
+        self.cash = 0
+        self.positions = {}          # mint -> (token_amount, cost_lamports)
+        self.mints = {}              # mint -> Mint
+        self.pending = {}            # client_id -> (mint, side, amount, kind)
+        self.pending_by_mint = {}    # mint -> set of client_ids
+        self.probe_queue = deque()
+        self.probe_active = set()    # mints with a probe in flight (O(1) size)
+        self.counted_count = 0
+        self.peak_equity = 0
+        self.halt_momentum = False
+        self.order_seq = 0
+        self.traded_this_batch = []
 
+    # -- pending bookkeeping ------------------------------------------------
 
-class Held:
-    __slots__ = ("opened", "peak_value", "invested", "exiting", "filled",
-                 "last_add_price", "last_value")
+    def _pending_add(self, cid, mint, side, amount, kind):
+        self.pending[cid] = (mint, side, amount, kind)
+        s = self.pending_by_mint.get(mint)
+        if s is None:
+            s = set()
+            self.pending_by_mint[mint] = s
+        s.add(cid)
 
-    def __init__(self, opened, invested, last_add_price):
-        self.opened = opened
-        self.peak_value = 0.0
-        self.invested = invested  # SOL sent in buys for this position
-        self.exiting = False
-        self.filled = False
-        self.last_add_price = last_add_price
-        self.last_value = 0.0
+    def _pending_drop(self, cid):
+        rec = self.pending.pop(cid, None)
+        if rec is not None:
+            s = self.pending_by_mint.get(rec[0])
+            if s is not None:
+                s.discard(cid)
+                if not s:
+                    del self.pending_by_mint[rec[0]]
+        return rec
 
+    def _has_pending(self, mint, side=None):
+        s = self.pending_by_mint.get(mint)
+        if not s:
+            return False
+        if side is None:
+            return True
+        for cid in s:
+            if self.pending[cid][1] == side:
+                return True
+        return False
 
-class Bot:
-    def __init__(self, hello):
-        self.hello = hello
-        self.seq = -1
-        self.slot = -1
-        self.cash = int(hello["capital"]["lamports"])
-        self.positions = {}  # mint -> (token_amount, cost_lamports)
-        self.curves = {}     # mint -> Curve, first-seen order
-        self.pending = {}    # client_id -> order dict, send order
-        self._used_ids = set()
-        self._next_id = 1
-        self.tapes = {}      # mint -> Tape
-        self.held = {}       # mint -> Held
-        self.probes = {}     # mint -> bool (False buying, True selling)
-        self.my_fills = 0
-        self.my_coins = set()
-        self.first_time = None
-        self.last_time = None
+    def _free_cash(self):
+        committed = 0
+        for _mint, side, amount, _kind in self.pending.values():
+            committed += self.tx_fee
+            if side == "buy":
+                committed += amount
+        return self.cash - committed
 
-    # --- protocol helpers -------------------------------------------------
-    def tx_fee_lamports(self):
-        fees = self.hello["fees"]
-        return int(fees["base_fee_lamports"]) + int(fees["priority_fee_lamports"])
-
-    def max_buy_lamports(self, mint):
-        curve = self.curves.get(mint)
-        if curve is None or curve.complete:
-            return 0
-        return curve.real_quote_reserves * self.hello["caps"]["max_order_bps_of_real_reserve"] // BPS
-
-    def committed_position_count(self):
-        mints = set(self.positions)
-        for o in self.pending.values():
-            if o["side"] == "buy":
-                mints.add(o["mint"])
-        return len(mints)
-
-    def free_cash_lamports(self):
-        tx = self.tx_fee_lamports()
-        free = self.cash
-        for o in self.pending.values():
-            free -= tx
-            if o["side"] == "buy":
-                free -= int(o["quote_lamports"])
-        return free
-
-    def _fresh_id(self):
-        while True:
-            cid = "o%d" % self._next_id
-            self._next_id += 1
-            if cid not in self._used_ids:
-                self._used_ids.add(cid)
-                return cid
-
-    # --- batch intake -----------------------------------------------------
-    def apply_batch(self, batch):
-        self.seq = batch["seq"]
-        self.slot = batch["slot"]
-        for f in batch["fills"]:
-            self.pending.pop(f["client_id"], None)
-            if f["status"] == "filled" and not f["client_id"].startswith("_"):
-                self.my_fills += 1
-                self.my_coins.add(f["mint"])
-        account = batch["account"]
-        self.cash = int(account["cash_lamports"])
-        self.positions = {}
-        for p in account["positions"]:
-            tokens = int(p["token_amount"])
-            if tokens > 0:
-                self.positions[p["mint"]] = (tokens, int(p["cost_lamports"]))
-        for m in batch["marks"]:
-            curve = self.curves.get(m["mint"])
-            if curve is not None and int(m["slot"]) < curve.reserves_slot:
+    def _committed_positions(self):
+        n = len(self.positions)
+        for mint in self.pending_by_mint:
+            if mint in self.positions:
                 continue
-            if curve is None:
-                curve = Curve(m["mint"], None, int(m["slot"]))
-                self.curves[m["mint"]] = curve
-            curve.virtual_token_reserves = int(m["virtual_token_reserves"])
-            curve.virtual_quote_reserves = int(m["virtual_quote_reserves"])
-            curve.real_token_reserves = int(m["real_token_reserves"])
-            curve.real_quote_reserves = int(m["real_quote_reserves"])
-            curve.reserves_slot = int(m["slot"])
-        for e in batch["events"]:
-            kind = e["event"]
+            for cid in self.pending_by_mint[mint]:
+                if self.pending[cid][1] == "buy":
+                    n += 1
+                    break
+        return n
+
+    def _reserve_cap(self, mint):
+        m = self.mints[mint]
+        return m.rsol * self.reserve_bps // 10_000
+
+    # -- input processing ---------------------------------------------------
+
+    def on_hello(self, msg):
+        fees = msg.get("fees") or {}
+        base = fees.get("base_fee_lamports")
+        prio = fees.get("priority_fee_lamports")
+        if base is not None and prio is not None:
+            self.tx_fee = int(base) + int(prio)
+        caps = msg.get("caps") or {}
+        if caps.get("max_open_positions") is not None:
+            self.max_positions = int(caps["max_open_positions"])
+        if caps.get("max_orders_per_batch") is not None:
+            self.max_orders = int(caps["max_orders_per_batch"])
+        if caps.get("max_order_bps_of_real_reserve") is not None:
+            self.reserve_bps = int(caps["max_order_bps_of_real_reserve"])
+        cap = msg.get("capital")
+        if isinstance(cap, dict):
+            cap = cap.get("lamports")
+        if cap is not None:
+            self.cash = int(cap)
+
+    def _process_fills(self, fills):
+        for f in fills:
+            cid = f.get("client_id")
+            if cid is None or cid.startswith("_"):
+                continue
+            rec = self._pending_drop(cid)
+            if rec is None:
+                continue
+            mint, side, _amount, kind = rec
+            m = self.mints.get(mint)
+            if m is None:
+                continue
+            if f.get("status") == "filled":
+                if side == "buy":
+                    q = int(f.get("quote_lamports") or 0)
+                    m.buy_fills += q
+                    m.total_buys += q
+                    if kind == "mom" or kind == "add":
+                        m.stake_mom += q
+                    if kind == "probe":
+                        m.probe_last_fill = int(f.get("slot") or 0)
+                        if m.buy_fills >= MIN_ROUND_TRIP_BUY:
+                            m.probe_stage = "holding"
+                # Filled sells need no bookkeeping: the account snapshot
+                # next batch reflects the new position.
+            else:
+                # failed / rejected: unwind the intent so it can retry.
+                if kind == "probe":
+                    m.probe_stage = "none"
+                    m.probe_attempts += 1
+                    self.probe_active.discard(mint)
+                elif kind == "add":
+                    m.added = False
+
+    def _process_account(self, account, slot):
+        if account is None:
+            return
+        self.cash = int(account.get("cash_lamports") or 0)
+        new_positions = {}
+        for p in account.get("positions") or []:
+            new_positions[p["mint"]] = (
+                int(p.get("token_amount") or 0),
+                int(p.get("cost_lamports") or 0),
+            )
+        old = self.positions
+        # Closures: a mint held last batch and gone now has completed its
+        # round trip (our sell, a curve completion or the final flatten).
+        for mint in old:
+            if mint not in new_positions:
+                m = self.mints.get(mint)
+                if m is not None:
+                    if not m.counted and m.buy_fills >= MIN_ROUND_TRIP_BUY:
+                        m.counted = True
+                        self.counted_count += 1
+                    m.last_exit_slot = slot
+                    m.open_slot = -1
+                    m.probe_stage = "none"
+                    self.probe_active.discard(mint)
+        # Openings: initialise live-position bookkeeping.
+        for mint in new_positions:
+            if mint not in old:
+                m = self.mints.get(mint)
+                if m is not None:
+                    m.open_slot = slot
+                    m.peak_price = m.price()
+                    m.tp_done = False
+                    if m.stake_mom == 0:
+                        m.added = False
+        self.positions = new_positions
+
+    def _process_events(self, events, slot):
+        self.traded_this_batch = []
+        seen = set()
+        for ev in events:
+            kind = ev.get("event")
+            mint = ev.get("mint")
+            if mint is None:
+                continue
+            m = self.mints.get(mint)
             if kind == "CreateEvent":
-                curve = Curve(e["mint"], e["slot"], e["slot"])
-                self.curves[e["mint"]] = curve
-                # Real CreateEvents carry virtual_sol_reserves; some also carry
-                # virtual_quote_reserves. Either names the same SOL-side reserve.
-                vq = e.get("virtual_quote_reserves") or e.get("virtual_sol_reserves") or 0
-                curve.virtual_token_reserves = int(e["virtual_token_reserves"])
-                curve.virtual_quote_reserves = int(vq)
-                curve.real_token_reserves = int(e["real_token_reserves"])
-                curve.real_quote_reserves = 0
-                self.tape_of(e["mint"]).created = e["slot"]
-            elif kind == "TradeEvent":
-                curve = self.curves.get(e["mint"])
-                if curve is None:
-                    curve = Curve(e["mint"], None, e["slot"])
-                    self.curves[e["mint"]] = curve
-                curve.virtual_token_reserves = int(e["virtual_token_reserves"])
-                curve.virtual_quote_reserves = int(e["virtual_quote_reserves"])
-                curve.real_token_reserves = int(e["real_token_reserves"])
-                curve.real_quote_reserves = int(e["real_quote_reserves"])
-                curve.reserves_slot = e["slot"]
-                tape = self.tape_of(e["mint"])
-                price = int(e["virtual_quote_reserves"]) / int(e["virtual_token_reserves"])
-                tape.trades.append((e["slot"], bool(e["is_buy"]),
-                                    int(e["sol_amount"]) / LAMPORTS_PER_SOL,
-                                    e["user"], price))
-            else:  # CompleteEvent
-                curve = self.curves.get(e["mint"])
-                if curve is None:
-                    curve = Curve(e["mint"], None, e["slot"])
-                    self.curves[e["mint"]] = curve
-                curve.complete = True
-
-    def tape_of(self, mint):
-        tape = self.tapes.get(mint)
-        if tape is None:
-            tape = Tape()
-            self.tapes[mint] = tape
-        return tape
-
-    # --- strategy ---------------------------------------------------------
-    def entry_signal(self, tape, now, rq_sol):
-        if rq_sol < MIN_RQ_SOL or rq_sol > MAX_RQ_SOL:
-            return False
-        if tape.created is None or now - tape.created < MIN_AGE:
-            return False
-        start = now - WINDOW
-        mid = now - WINDOW / 2
-        buy_sol = 0.0
-        sell_sol = 0.0
-        buys = 0
-        net_old = 0.0
-        net_new = 0.0
-        start_price = -1.0
-        high = 0.0
-        last = 0.0
-        buyers = {}
-        for (slot, is_buy, sol, user, price) in tape.trades:
-            if slot <= start:
-                start_price = price
+                if m is None:
+                    m = Mint(slot)
+                    self.mints[mint] = m
+                vsol, vtok, rsol, rtok = _reserves(ev)
+                if vsol:
+                    m.vsol = vsol
+                if vtok:
+                    m.vtok = vtok
+                if rsol:
+                    m.rsol = rsol
+                if rtok:
+                    m.rtok = rtok
                 continue
-            if start_price < 0:
-                start_price = price
+            if m is None:
+                m = Mint(slot)
+                self.mints[mint] = m
+            if kind == "CompleteEvent":
+                m.alive = False
+                continue
+            if kind != "TradeEvent":
+                continue
+            vsol, vtok, rsol, rtok = _reserves(ev)
+            m.vsol, m.vtok, m.rsol, m.rtok = vsol, vtok, rsol, rtok
+            m.last_trade_slot = slot
+            m.total_trades += 1
+            sol = int(ev.get("sol_amount") or 0)
+            is_buy = bool(ev.get("is_buy"))
             signed = sol if is_buy else -sol
-            if slot <= mid:
-                net_old += signed
-            else:
-                net_new += signed
-            if is_buy:
-                buy_sol += sol
-                buys += 1
-                buyers[user] = buyers.get(user, 0.0) + sol
-            else:
-                sell_sol += sol
-            if price > high:
-                high = price
-            last = price
-        if buys < MIN_BUYS or len(buyers) < MIN_BUYERS:
-            return False
-        if buy_sol - sell_sol < MIN_NET_SOL:
-            return False
-        if start_price <= 0:
-            return False
-        up = last / start_price - 1
-        if up < MIN_PRICE_UP or up > MAX_PRICE_UP:
-            return False
-        if last < high * NEAR_HIGH:
-            return False
-        if net_new <= 0 or net_new < ACCEL * net_old:
-            return False
-        top = max(buyers.values()) if buyers else 0.0
-        if top > buy_sol:  # single wallet dominating the buys
-            return False
-        return True
+            m.tape.append((slot, signed, is_buy, ev.get("user") or "", m.price()))
+            cutoff = slot - TAPE_KEEP_SLOTS
+            while m.tape and (m.tape[0][0] < cutoff or len(m.tape) > TAPE_MAX_TRADES):
+                m.tape.popleft()
+            if mint not in seen:
+                seen.add(mint)
+                self.traded_this_batch.append(mint)
+            self._maybe_queue_probe(mint, slot)
 
-    def flow(self, tape, now, window):
-        net = 0.0
-        for i in range(len(tape.trades) - 1, -1, -1):
-            slot, is_buy, sol, _user, _price = tape.trades[i]
-            if slot <= now - window:
-                break
-            net += sol if is_buy else -sol
-        return net
-
-    def decide(self, batch):
-        now = batch["slot"]
-        # Track block time for guardrail pacing.
-        for e in batch["events"]:
-            bt = e.get("block_time")
-            if bt is not None:
-                if self.first_time is None:
-                    self.first_time = bt
-                if self.last_time is None or bt > self.last_time:
-                    self.last_time = bt
-        # Prune tapes of curves that traded this batch.
-        keep = WINDOW + 5
-        traded = []       # mints with a TradeEvent this batch, first-seen order
-        traded_seen = set()
-        for e in batch["events"]:
-            if e["event"] == "TradeEvent" and e["mint"] not in traded_seen:
-                traded_seen.add(e["mint"])
-                traded.append(e["mint"])
-        for mint in traded:
-            tape = self.tapes.get(mint)
-            if tape is None:
+    def _process_marks(self, marks):
+        for mk in marks or []:
+            mint = mk.get("mint")
+            m = self.mints.get(mint)
+            if m is None:
                 continue
-            cut = 0
-            while cut < len(tape.trades) and tape.trades[cut][0] <= now - keep:
-                cut += 1
-            if cut:
-                del tape.trades[:cut]
+            vsol, vtok, rsol, rtok = _reserves(mk)
+            if vtok:
+                m.vsol, m.vtok, m.rsol, m.rtok = vsol, vtok, rsol, rtok
+            if mint in self.positions:
+                p = m.price()
+                if p > m.peak_price:
+                    m.peak_price = p
 
-        marks = {m["mint"]: m for m in batch["marks"]}
-        pending_by_mint = {}
-        for o in self.pending.values():
-            pending_by_mint[o["mint"]] = pending_by_mint.get(o["mint"], 0) + 1
+    # -- probe engine ---------------------------------------------------------
 
+    def _maybe_queue_probe(self, mint, slot):
+        m = self.mints[mint]
+        if (
+            m.counted
+            or m.in_queue
+            or m.probe_stage != "none"
+            or m.probe_attempts >= PROBE_MAX_ATTEMPTS
+            or m.buy_fills > 0
+            or not m.alive
+            or mint in self.positions
+            or self._has_pending(mint, "buy")
+            or m.rsol < PROBE_MIN_RESERVE
+        ):
+            return
+        m.in_queue = True
+        self.probe_queue.append(mint)
+
+    def _probe_orders(self, slot, orders):
+        # First, top up probes that are still accumulating buy fills: on a
+        # shallow curve one reply's 1%-of-reserve cap buys less than the
+        # 0.01 SOL a countable round trip needs, so tranches stack across
+        # batches until the mint's buy fills clear the minimum.
+        for mint in sorted(self.probe_active):
+            if len(orders) >= self.max_orders:
+                return
+            m = self.mints[mint]
+            if (
+                m.probe_stage != "accumulating"
+                or m.buy_fills >= PROBE_TARGET_BUYS
+                or self._has_pending(mint, "buy")
+                or not m.alive
+            ):
+                continue
+            quote = min(PROBE_TARGET_BUYS - m.buy_fills, self._reserve_cap(mint))
+            if quote < PROBE_MIN_PER_REPLY:
+                continue
+            if quote + self.tx_fee > self._free_cash() - 5_000_000:
+                break
+            self.order_seq += 1
+            cid = "b%d" % self.order_seq
+            orders.append({
+                "side": "buy",
+                "client_id": cid,
+                "mint": mint,
+                "quote_lamports": str(quote),
+                "max_slippage_bps": SLIP_BUY,
+            })
+            self._pending_add(cid, mint, "buy", quote, "probe")
+        in_flight = len(self.probe_active)
+        while (
+            len(orders) < self.max_orders
+            and self.counted_count + in_flight < PROBE_TARGET_COUNT
+            and self.probe_queue
+        ):
+            mint = self.probe_queue.popleft()
+            m = self.mints[mint]
+            m.in_queue = False
+            if (
+                m.counted
+                or m.probe_stage != "none"
+                or m.probe_attempts >= PROBE_MAX_ATTEMPTS
+                or m.buy_fills > 0
+                or not m.alive
+                or mint in self.positions
+                or self._has_pending(mint, "buy")
+                or slot - m.last_trade_slot > PROBE_RECENT_TRADE
+                or m.rsol < PROBE_MIN_RESERVE
+            ):
+                continue
+            if self._committed_positions() >= self.max_positions:
+                m.in_queue = True
+                self.probe_queue.appendleft(mint)
+                break
+            quote = min(PROBE_TARGET_BUYS - m.buy_fills, self._reserve_cap(mint))
+            if quote < PROBE_MIN_PER_REPLY:
+                continue
+            if quote + self.tx_fee > self._free_cash() - 5_000_000:
+                break
+            self.order_seq += 1
+            cid = "b%d" % self.order_seq
+            orders.append({
+                "side": "buy",
+                "client_id": cid,
+                "mint": mint,
+                "quote_lamports": str(quote),
+                "max_slippage_bps": SLIP_BUY,
+            })
+            self._pending_add(cid, mint, "buy", quote, "probe")
+            m.probe_stage = "accumulating"
+            self.probe_active.add(mint)
+            in_flight += 1
+
+    # -- exits ----------------------------------------------------------------
+
+    def _exit_orders(self, slot, orders):
+        for mint in sorted(self.positions):
+            if len(orders) >= self.max_orders:
+                break
+            if self._has_pending(mint, "sell"):
+                continue
+            m = self.mints.get(mint)
+            if m is None:
+                continue
+            token_amount, cost = self.positions[mint]
+            if token_amount <= 0:
+                continue
+            price = m.price()
+            if price <= 0:
+                continue
+            entry = cost / token_amount if token_amount else 0.0
+            sell_amount = 0
+            slip = SLIP_EXIT
+            if m.stake_mom == 0 and m.probe_stage in ("accumulating", "holding"):
+                # Pure probe position: leave once the round trip is worth
+                # counting (buy fills >= the guardrail minimum) and the
+                # position has seasoned a few slots.  If the top-ups never
+                # got it there, give up later and free the slot.
+                last = m.probe_last_fill if m.probe_last_fill >= 0 else m.open_slot
+                age = slot - last
+                if m.buy_fills >= MIN_ROUND_TRIP_BUY and age >= PROBE_SELL_AGE:
+                    sell_amount = token_amount
+                    slip = SLIP_PROBE_SELL
+                elif age >= PROBE_GIVE_UP_AGE:
+                    sell_amount = token_amount
+                    slip = SLIP_PROBE_SELL
+            elif entry > 0:
+                if price <= entry * (1.0 - STOP_LOSS_FRAC):
+                    sell_amount = token_amount
+                elif (
+                    m.peak_price >= entry * (1.0 + TRAIL_ARM_FRAC)
+                    and price <= m.peak_price * (1.0 - TRAIL_DROP_FRAC)
+                ):
+                    sell_amount = token_amount
+                elif m.open_slot >= 0 and slot - m.open_slot >= MAX_HOLD_SLOTS:
+                    sell_amount = token_amount
+                elif not m.tp_done and price >= entry * TAKE_PROFIT_MULT:
+                    sell_amount = token_amount // 2
+                    m.tp_done = True
+            if sell_amount > 0:
+                self.order_seq += 1
+                cid = "b%d" % self.order_seq
+                orders.append({
+                    "side": "sell",
+                    "client_id": cid,
+                    "mint": mint,
+                    "token_amount": str(sell_amount),
+                    "max_slippage_bps": slip,
+                })
+                self._pending_add(cid, mint, "sell", sell_amount, "sell")
+
+    # -- momentum sleeve ------------------------------------------------------
+
+    def _window_stats(self, m, slot):
+        """(net_inflow, buy_volume, total_volume, distinct_buyers) over the
+        inflow window, plus the price at the momentum lag and the window's
+        base-low price."""
+        net = 0
+        buy_vol = 0
+        tot_vol = 0
+        buyers = set()
+        lag_price = 0.0
+        base_low = 0.0
+        win_start = slot - MOM_INFLOW_WINDOW
+        lag_slot = slot - MOM_LAG
+        base_start = slot - MOM_BASE_WINDOW
+        for t_slot, signed, is_buy, user, price in m.tape:
+            if t_slot > win_start:
+                net += signed
+                tot_vol += abs(signed)
+                if is_buy:
+                    buy_vol += signed
+                    buyers.add(user)
+            if t_slot <= lag_slot:
+                lag_price = price
+            if t_slot > base_start and price > 0:
+                if base_low == 0.0 or price < base_low:
+                    base_low = price
+        return net, buy_vol, tot_vol, len(buyers), lag_price, base_low
+
+    def _momentum_orders(self, slot, orders):
+        if self.halt_momentum:
+            return  # drawdown circuit breaker: probes still run, risk off
+        for mint in sorted(self.traded_this_batch):
+            if len(orders) >= self.max_orders:
+                break
+            m = self.mints.get(mint)
+            if m is None or not m.alive:
+                continue
+            if self._has_pending(mint, "buy"):
+                continue
+            if slot - m.mom_eval_slot < MOM_EVAL_EVERY:
+                continue
+            m.mom_eval_slot = slot
+            held = mint in self.positions
+            if held and m.stake_mom == 0:
+                continue  # probe position: the probe engine owns it
+            if not held:
+                if m.counted and slot - m.last_exit_slot < MOM_COOLDOWN:
+                    continue
+                if m.last_exit_slot >= 0 and slot - m.last_exit_slot < MOM_COOLDOWN:
+                    continue
+                if m.probe_stage != "none":
+                    continue
+                if slot - m.created < MOM_MIN_AGE:
+                    continue
+                if m.total_trades < MOM_MIN_TRADES:
+                    continue
+                if m.rsol < MOM_MIN_RESERVE:
+                    continue
+                if self._committed_positions() >= self.max_positions:
+                    continue
+            net, buy_vol, tot_vol, buyers, lag_price, base_low = \
+                self._window_stats(m, slot)
+            price = m.price()
+            if price <= 0 or lag_price <= 0 or base_low <= 0:
+                continue
+            inflow_ok = net >= MOM_INFLOW_MIN or (
+                buy_vol >= MOM_BUYVOL_MIN
+                and tot_vol > 0
+                and buy_vol / tot_vol >= MOM_BUY_SHARE_MIN
+            )
+            if not inflow_ok or buyers < MOM_MIN_BUYERS:
+                continue
+            if price / lag_price - 1.0 < MOM_MIN_GAIN:
+                continue
+            if price > base_low * MOM_MAX_VS_BASE:
+                continue  # parabolic top: do not chase
+            room = MOM_MAX_STAKE - m.total_buys
+            if room < MOM_MIN_BUY:
+                continue
+            if not held:
+                quote = min(MOM_FIRST_BUY, self._reserve_cap(mint), room)
+                kind = "mom"
+            else:
+                if m.added:
+                    continue
+                token_amount, cost = self.positions[mint]
+                entry = cost / token_amount if token_amount else 0.0
+                if entry <= 0 or price < entry * 1.10 or net <= 0:
+                    continue
+                quote = min(MOM_ADD_BUY, self._reserve_cap(mint), room)
+                kind = "add"
+            if quote < MOM_MIN_BUY:
+                continue
+            if quote + self.tx_fee > self._free_cash() - CASH_BUFFER:
+                continue
+            self.order_seq += 1
+            cid = "b%d" % self.order_seq
+            orders.append({
+                "side": "buy",
+                "client_id": cid,
+                "mint": mint,
+                "quote_lamports": str(quote),
+                "max_slippage_bps": SLIP_BUY,
+            })
+            self._pending_add(cid, mint, "buy", quote, kind)
+            if kind == "add":
+                m.added = True
+
+    # -- batch driver -----------------------------------------------------------
+
+    def on_batch(self, msg):
+        slot = int(msg.get("slot") or 0)
+        self._process_fills(msg.get("fills") or [])
+        self._process_account(msg.get("account"), slot)
+        self._process_events(msg.get("events") or [], slot)
+        self._process_marks(msg.get("marks") or [])
+        # Equity estimate for the drawdown circuit breaker: cash plus the
+        # curve value of every open position at current virtual reserves.
+        equity = self.cash
+        for mint, (token_amount, cost) in self.positions.items():
+            m = self.mints.get(mint)
+            if m is not None and m.vtok > 0 and token_amount > 0:
+                equity += token_amount * m.vsol // (m.vtok + token_amount)
+            else:
+                equity += cost
+        if equity > self.peak_equity:
+            self.peak_equity = equity
+        self.halt_momentum = (
+            self.peak_equity > 0
+            and equity < self.peak_equity * (1.0 - DD_HALT_FRAC)
+        )
         orders = []
-        cap = self.hello["caps"]["max_orders_per_batch"]
-        tx = self.tx_fee_lamports() / LAMPORTS_PER_SOL
-
-        # --- exits first ---------------------------------------------------
-        for mint in list(self.held):
-            h = self.held[mint]
-            pos = self.positions.get(mint)
-            curve = self.curves.get(mint)
-            if pos is None:
-                if mint not in pending_by_mint:
-                    del self.held[mint]
-                    tape = self.tape_of(mint)
-                    if h.filled:
-                        tape.last_exit = now
-                    else:
-                        tape.entries -= 1
-                continue
-            h.filled = True
-            if curve is None or curve.complete:
-                continue
-            mk = marks.get(mint)
-            vq = int(mk["virtual_quote_reserves"]) if mk else curve.virtual_quote_reserves
-            vt = int(mk["virtual_token_reserves"]) if mk else curve.virtual_token_reserves
-            rq_sol = (int(mk["real_quote_reserves"]) if mk else curve.real_quote_reserves) / LAMPORTS_PER_SOL
-            tokens, cost_lamports = pos
-            value = ((tokens * vq) / (vt + tokens) / LAMPORTS_PER_SOL) * (1 - CURVE_FEE) - tx
-            cost = cost_lamports / LAMPORTS_PER_SOL
-            if value > h.peak_value:
-                h.peak_value = value
-            h.last_value = value
-            exit_now = h.exiting
-            tape = self.tape_of(mint)
-            if not exit_now and value < cost * (1 - STOP_LOSS):
-                exit_now = True
-            if (not exit_now and h.peak_value >= cost * (1 + TRAIL_ARM)
-                    and value < h.peak_value * (1 - TRAIL)):
-                exit_now = True
-            if not exit_now and self.flow(tape, now, 15) < -1000:
-                exit_now = True  # fade: net flow collapsed (threshold off by design)
-            if not exit_now and now - h.opened > MAX_HOLD:
-                exit_now = True  # max hold (holdIfUp = 1000 in the pilot: always applies)
-            if not exit_now:
-                continue
-            h.exiting = True
-            if mint in pending_by_mint:
-                sell_pending = any(
-                    o["mint"] == mint and o["side"] == "sell"
-                    for o in self.pending.values()
-                )
-                if sell_pending:
-                    continue
-            if len(orders) >= cap:
-                break
-            orders.append({"side": "sell", "mint": mint,
-                           "token_amount": str(tokens),
-                           "max_slippage_bps": 10000})
-
-        # --- probe round trips: sell the whole probe once its buy landed ---
-        for mint in list(self.probes):
-            selling = self.probes[mint]
-            pos = self.positions.get(mint)
-            curve = self.curves.get(mint)
-            if pos is None:
-                if mint not in pending_by_mint:
-                    del self.probes[mint]
-                continue
-            if curve is None or curve.complete or mint in pending_by_mint:
-                continue
-            if len(orders) >= cap:
-                break
-            orders.append({"side": "sell", "mint": mint,
-                           "token_amount": str(pos[0]),
-                           "max_slippage_bps": 10000})
-            if not selling:
-                self.probes[mint] = True
-
-        # --- entries and pyramid adds ---------------------------------------
-        free = self.free_cash_lamports() / LAMPORTS_PER_SOL
-        slots_left = self.hello["caps"]["max_open_positions"] - self.committed_position_count()
-        main_left = MAX_MAIN - len(self.held)
-        exposure = 0.0
-        for mint, h in self.held.items():
-            pos = self.positions.get(mint)
-            exposure += max(h.invested, (pos[1] / LAMPORTS_PER_SOL) if pos else 0.0)
-        for mint in traded:
-            if len(orders) >= cap:
-                break
-            curve = self.curves.get(mint)
-            if curve is None or curve.complete:
-                continue
-            if mint in pending_by_mint or mint in self.probes:
-                continue
-            tape = self.tapes.get(mint)
-            if tape is None:
-                continue
-            h = self.held.get(mint)
-            price = curve.virtual_quote_reserves / curve.virtual_token_reserves
-            rq_sol = curve.real_quote_reserves / LAMPORTS_PER_SOL
-            if h is None:
-                if slots_left <= 0 or main_left <= 0:
-                    continue
-                if tape.entries >= MAX_ENTRIES or now - tape.last_exit < COOLDOWN:
-                    continue
-                if not self.entry_signal(tape, now, rq_sol):
-                    continue
-                want = min(INITIAL_SOL, STAKE_SOL)
-            else:
-                if h.exiting or not h.filled or h.invested >= STAKE_SOL - MIN_BUY_SOL:
-                    continue
-                pos = self.positions.get(mint)
-                if pos is None:
-                    continue
-                if price < h.last_add_price:
-                    continue
-                if h.last_value < (pos[1] / LAMPORTS_PER_SOL):
-                    continue
-                if self.flow(tape, now, WINDOW) < 0:
-                    continue
-                if rq_sol > MAX_RQ_SOL:
-                    continue
-                want = min(ADD_SOL, STAKE_SOL - h.invested)
-            cap_sol = self.max_buy_lamports(mint) / LAMPORTS_PER_SOL
-            amount = min(cap_sol, want, MAX_EXPOSURE_SOL - exposure)
-            if amount > free - tx:
-                amount = free - tx
-            if amount < MIN_BUY_SOL:
-                continue
-            lamports = int(amount * LAMPORTS_PER_SOL)
-            orders.append({"side": "buy", "mint": mint,
-                           "quote_lamports": str(lamports),
-                           "max_slippage_bps": BUY_SLIP_BPS})
-            free -= amount + tx
-            exposure += amount
-            if h is None:
-                self.held[mint] = Held(now, amount, price)
-                tape.entries += 1
-                slots_left -= 1
-                main_left -= 1
-            else:
-                h.invested += amount
-                h.last_add_price = price
-
-        # --- guardrail pacing: open a probe when fills/coins lag the pace ---
-        if (len(self.probes) < MAX_PROBES and slots_left > 0
-                and self.first_time is not None and self.last_time is not None):
-            pace = min(1.0, (self.last_time - self.first_time) / PACE_SECS)
-            need_coins = len(self.my_coins) < math.ceil(TARGET_COINS * pace)
-            need_fills = self.my_fills < math.ceil(TARGET_FILLS * pace)
-            if need_coins or need_fills:
-                min_rq = (PROBE_SOL * BPS) / self.hello["caps"]["max_order_bps_of_real_reserve"]
-                for mint in traded:
-                    if len(orders) >= cap or len(self.probes) >= MAX_PROBES:
-                        break
-                    if mint in self.held or mint in self.probes or mint in pending_by_mint:
-                        continue
-                    if mint in self.positions:
-                        continue
-                    if need_coins and not need_fills and mint in self.my_coins:
-                        continue
-                    curve = self.curves.get(mint)
-                    if curve is None or curve.complete:
-                        continue
-                    if curve.real_quote_reserves / LAMPORTS_PER_SOL < min_rq * 1.5:
-                        continue
-                    if free < PROBE_SOL + 2 * tx:
-                        break
-                    orders.append({"side": "buy", "mint": mint,
-                                   "quote_lamports": str(int(PROBE_SOL * LAMPORTS_PER_SOL)),
-                                   "max_slippage_bps": BUY_SLIP_BPS})
-                    self.probes[mint] = False
-                    free -= PROBE_SOL + tx
-
-        return orders
-
-    # --- wire ---------------------------------------------------------------
-    def validate_orders(self, orders):
-        cap = self.hello["caps"]["max_orders_per_batch"]
-        if len(orders) > cap:
-            raise OrderError("batch %d: %d orders over max_orders_per_batch (%d)"
-                             % (self.seq, len(orders), cap))
-        checked = []
-        for i, o in enumerate(orders):
-            if not isinstance(o, dict):
-                raise OrderError("batch %d order %d: not a dict" % (self.seq, i))
-            side = o.get("side")
-            if side not in ("buy", "sell"):
-                raise OrderError("batch %d order %d: bad side %r" % (self.seq, i, side))
-            allowed = ("side", "client_id", "mint", "quote_lamports", "max_slippage_bps") \
-                if side == "buy" else \
-                ("side", "client_id", "mint", "token_amount", "max_slippage_bps")
-            for k in o:
-                if k not in allowed:
-                    raise OrderError("batch %d order %d: unknown key %r" % (self.seq, i, k))
-            mint = o.get("mint")
-            if not isinstance(mint, str) or not _PUBKEY_RE.fullmatch(mint):
-                raise OrderError("batch %d order %d: bad mint %r" % (self.seq, i, mint))
-            amount_key = "quote_lamports" if side == "buy" else "token_amount"
-            amount = o.get(amount_key)
-            n = None
-            if type(amount) is int:
-                n = amount
-            elif isinstance(amount, str) and re.fullmatch(r"0|[1-9][0-9]{0,19}", amount):
-                n = int(amount)
-            if n is None or n < 0 or n > U64_MAX:
-                raise OrderError("batch %d order %d: bad %s %r" % (self.seq, i, amount_key, amount))
-            bps = o.get("max_slippage_bps")
-            if type(bps) is not int or not 0 <= bps <= 10000:
-                raise OrderError("batch %d order %d: bad max_slippage_bps %r" % (self.seq, i, bps))
-            cid = o.get("client_id")
-            if cid is None:
-                cid = self._fresh_id()
-            elif not isinstance(cid, str) or not _CLIENT_ID_RE.fullmatch(cid):
-                raise OrderError("batch %d order %d: bad client_id %r" % (self.seq, i, cid))
-            checked.append({"side": side, "client_id": cid, "mint": mint,
-                            amount_key: str(n), "max_slippage_bps": bps})
-        return checked
-
-    def run(self):
-        # Serves one run: builds the real Bot state on hello. `self` is only a
-        # throwaway shell here (see _main); no state is read before hello.
-        out = sys.stdout
-        state = None
-        for raw in sys.stdin.buffer:
-            line = raw.decode("utf-8").rstrip("\r\n")
-            if not line.strip():
-                continue
-            if len(raw) > MAX_HARNESS_LINE_BYTES:
-                raise ProtocolError("input line over %d bytes" % MAX_HARNESS_LINE_BYTES)
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                raise ProtocolError("input line is not JSON") from None
-            kind = msg.get("type") if isinstance(msg, dict) else None
-            if kind == "hello":
-                if state is not None:
-                    raise ProtocolError("a second hello")
-                if msg.get("protocol") != PROTOCOL:
-                    raise ProtocolError("wrong protocol: %r" % (msg.get("protocol"),))
-                state = Bot(msg)
-                bot = state
-            elif kind == "batch":
-                if state is None:
-                    raise ProtocolError("a batch before hello")
-                if (type(msg.get("seq")) is not int or type(msg.get("slot")) is not int
-                        or not isinstance(msg.get("events"), list)
-                        or not isinstance(msg.get("marks"), list)
-                        or not isinstance(msg.get("fills"), list)
-                        or not isinstance(msg.get("account"), dict)):
-                    raise ProtocolError("malformed batch")
-                state.apply_batch(msg)
-                orders = state.validate_orders(state.decide(msg))
-                text = json.dumps({"type": "reply", "seq": msg["seq"], "orders": orders},
-                                  separators=(",", ":"), ensure_ascii=False)
-                if len(text.encode("utf-8")) > MAX_BOT_LINE_BYTES:
-                    raise OrderError("reply over %d bytes" % MAX_BOT_LINE_BYTES)
-                for o in orders:
-                    state.pending[o["client_id"]] = o
-                out.write(text + "\n")
-                out.flush()
-            elif kind == "done":
-                if state is None:
-                    raise ProtocolError("done before hello")
-                return 0
-            else:
-                raise ProtocolError("unknown message type %r" % (kind,))
-        if state is None:
-            raise ProtocolError("input ended before hello")
-        raise ProtocolError("input ended before done")
+        self._exit_orders(slot, orders)
+        self._probe_orders(slot, orders)
+        self._momentum_orders(slot, orders)
+        return {"type": "reply", "seq": msg.get("seq"), "orders": orders}
 
 
-def _main():
-    # A throwaway Bot instance only to host run(); run() builds the real one on hello.
-    shell = Bot.__new__(Bot)
-    return shell.run()
+def main():
+    bot = Bot()
+    out = sys.stdout
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        mtype = msg.get("type")
+        if mtype == "hello":
+            bot.on_hello(msg)
+        elif mtype == "batch":
+            reply = bot.on_batch(msg)
+            out.write(json.dumps(reply, separators=(",", ":")) + "\n")
+            out.flush()
+        elif mtype == "done":
+            break
 
 
 if __name__ == "__main__":
-    sys.exit(_main())
+    main()
